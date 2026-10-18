@@ -540,7 +540,14 @@ async function readPage(pdf,n){
   const items=tc.items.filter(i=>i.str&&i.str.trim()).map(i=>({s:i.str,x:i.transform[4],y:i.transform[5],w:i.width||0,h:Math.abs(i.transform[3])||8}));
   const {cells}=buildCells(items);
   const text=cells.map(c=>c.s).join("\n");
-  const contentBottom=items.length?Math.max(0,Math.min(...items.map(i=>i.y-i.h*0.3))-4):null; // base do texto, para recortar a lista
+  // limites da tinta (em pontos, a partir do topo-esquerda), para recortar o branco das margens
+  let ink=null;
+  try{
+    const cv=document.createElement("canvas"); cv.width=Math.ceil(vp.width); cv.height=Math.ceil(vp.height);
+    const ctx=cv.getContext("2d"); ctx.fillStyle="#fff"; ctx.fillRect(0,0,cv.width,cv.height);
+    await page.render({canvasContext:ctx,viewport:vp}).promise;
+    ink=inkRect(cv,vp.width,vp.height,235);
+  }catch(e){ ink=null; }
 
   const hdr=cells.find(c=>/^(product name|nome do produto|produto)$/i.test(c.s));
   const skuH=cells.find(c=>/^(sku|varia[cç][aã]o)$/i.test(c.s));
@@ -585,7 +592,7 @@ async function readPage(pdf,n){
   const qtyTotal=(text.match(/qty\s*total\s*:?\s*(\d+)/i)||[])[1];
   const tracking=(text.match(/tracking\s*number\s*:?\s*([A-Z0-9]{8,30})/i)||[])[1]||null;
   const tokens=new Set((text.match(/\b[A-Z]{0,4}\d{10,24}[A-Z]{0,4}\b/g)||[]));
-  return {n,w:vp.width,h:vp.height,contentBottom,text,vars,product,qtyTotal:qtyTotal?parseInt(qtyTotal,10):null,tracking,tokens,noText:!items.length,key:(tracking?"t:"+tracking:(text?"h:"+cyrb53(text):"")),
+  return {n,w:vp.width,h:vp.height,ink,text,vars,product,qtyTotal:qtyTotal?parseInt(qtyTotal,10):null,tracking,tokens,noText:!items.length,key:(tracking?"t:"+tracking:(text?"h:"+cyrb53(text):"")),
           isInfo:vars.length>0||/packing list|lista de separa|product name|nome do produto/i.test(text)};
 }
 
@@ -643,11 +650,14 @@ function inkRatio(cv,r){
   for(let i=0;i<d.length;i+=4) if(d[i]<128) k++;
   return k/(r.w*r.h);
 }
-// limites da tinta no bitmap: {right, bottom} em pontos da folha 10x15 (para recortar o espaço em branco)
-function inkBounds(cv){
-  const w=cv.width,h=cv.height,d=cv.getContext("2d").getImageData(0,0,w,h).data; let mx=0,my=0;
-  for(let y=0;y<h;y++) for(let x=0;x<w;x++) if(d[(y*w+x)*4]<128){ if(x>mx) mx=x; if(y>my) my=y; }
-  return {right:Math.min(PT_W,(mx+12)*PT_W/w), bottom:Math.min(PT_H,(my+12)*PT_H/h)};
+// limites da tinta (pixels < limiar) em pontos {l,r,t,b} a partir do topo-esquerda, com folga de 6 pt
+function inkRect(cv,wPt,hPt,thr){
+  const w=cv.width,h=cv.height,d=cv.getContext("2d").getImageData(0,0,w,h).data;
+  let x0=w,x1=-1,y0=h,y1=-1;
+  for(let y=0;y<h;y++) for(let x=0;x<w;x++){ const o=(y*w+x)*4; if(d[o]<thr||d[o+1]<thr||d[o+2]<thr){ if(x<x0)x0=x; if(x>x1)x1=x; if(y<y0)y0=y; if(y>y1)y1=y; } }
+  if(x1<0) return null;
+  const kx=wPt/w, ky=hPt/h, pad=6;
+  return {l:Math.max(0,x0*kx-pad), r:Math.min(wPt,(x1+1)*kx+pad), t:Math.max(0,y0*ky-pad), b:Math.min(hPt,(y1+1)*ky+pad)};
 }
 function rotateCw(src){
   const c=document.createElement("canvas"); c.width=src.height; c.height=src.width;
@@ -712,9 +722,9 @@ async function addZpl(name,text){
       const r=await readChecklist(cv);
       vars=r.vars; product=r.product; txt=r.text; isInfo=vars.length>0||hdr;
     }
-    const ink=inkBounds(cv);
+    const ink=inkRect(cv,PT_W,PT_H,128);
     pages.push({n:i+1,w:PT_W,h:PT_H,key:"z:"+cyrb53(found[i][3]),text:txt,vars,product,qtyTotal:null,tracking:null,tokens:new Set(),noText:false,isInfo,
-                rot:!isLabel&&isInfo,inkRight:ink.right,inkBottom:isLabel?ink.bottom:null}); // rot: checklist da Shopee vem girado 90°
+                rot:!isLabel&&isInfo,ink}); // rot: checklist da Shopee vem girado 90°
     const blob=await new Promise(r=>cv.toBlob(r,"image/png"));
     const png=await doc.embedPng(new Uint8Array(await blob.arrayBuffer()));
     doc.addPage([PT_W,PT_H]).drawImage(png,{x:0,y:0,width:PT_W,height:PT_H});
@@ -967,36 +977,36 @@ async function buildPdf(){
     for(const o of g.orders){
       const f=files[o.fi], pg=o.pages.map(k=>f.pages[k]);
       const labelIdx=o.pages.find((k,j)=>!pg[j].isInfo), infoIdx=o.pages.find((k,j)=>pg[j].isInfo);
-      if($("mergeSheets").checked && o.pages.length===2 && labelIdx!=null && infoIdx!=null && (f.pages[infoIdx].rot||!f.pages[infoIdx].noText)){
+      if($("mergeSheets").checked && o.pages.length===2 && labelIdx!=null && infoIdx!=null && f.pages[infoIdx].ink){
         const lp=f.pages[labelIdx], ip=f.pages[infoIdx], W=lp.w, H=lp.h, horiz=document.querySelector('input[name="mergeLayout"]:checked').value==="horiz";
-        const lBottom=lp.inkBottom!=null?Math.max(0,lp.h-lp.inkBottom):0, lh=lp.h-lBottom; // etiqueta sem o branco do rodapé
-        // lista do pedido: recorta o que tem conteúdo. nw×nh = tamanho natural já na posição de leitura
-        let iBox, nw, nh;
-        if(ip.rot){ iBox={left:0,bottom:0,right:ip.inkRight,top:ip.h}; nw=ip.h; nh=ip.inkRight; } // checklist da Shopee vem girado
-        else { const bottom=Math.min(ip.h*0.6,ip.contentBottom); iBox={left:0,bottom,right:ip.w,top:ip.h}; nw=ip.w; nh=ip.h-bottom; }
+        // recorta o branco: cada parte vira só a região com tinta (l,r,t,b em pontos a partir do topo-esquerda)
+        const lk=lp.ink||{l:0,r:lp.w,t:0,b:lp.h}, ik=ip.ink||{l:0,r:ip.w,t:0,b:ip.h};
+        const lw=lk.r-lk.l, lh=lk.b-lk.t;
+        const nw=ip.rot?ik.b-ik.t:ik.r-ik.l, nh=ip.rot?ik.r-ik.l:ik.b-ik.t; // tamanho da lista já na posição de leitura (a da Shopee vem girada)
         const [eL,eI]=await Promise.all([
-          out.embedPage(srcs[o.fi].getPage(labelIdx),{left:0,bottom:lBottom,right:lp.w,top:lp.h}),
-          out.embedPage(srcs[o.fi].getPage(infoIdx),iBox)
+          out.embedPage(srcs[o.fi].getPage(labelIdx),{left:lk.l,bottom:lp.h-lk.b,right:lk.r,top:lp.h-lk.t}),
+          out.embedPage(srcs[o.fi].getPage(infoIdx),{left:ik.l,bottom:ip.h-ik.b,right:ik.r,top:ip.h-ik.t})
         ]);
         const drawInfo=(page,x,yTop,c)=>{ // (x,yTop) = canto superior esquerdo da lista já na posição de leitura
-          if(ip.rot) page.drawPage(eI,{x,y:yTop,width:ip.inkRight*c,height:ip.h*c,rotate:PDFLib.degrees(-90)});
+          if(ip.rot) page.drawPage(eI,{x,y:yTop,width:(ik.r-ik.l)*c,height:(ik.b-ik.t)*c,rotate:PDFLib.degrees(-90)});
           else page.drawPage(eI,{x,y:yTop-nh*c,width:nw*c,height:nh*c});
         };
-        const gap=H*0.012, line=color=>({thickness:0.5,color:rgb(0.5,0.5,0.5),dashArray:[3,3]});
+        const m=4, gap=H*0.012, dash={thickness:0.5,color:rgb(0.5,0.5,0.5),dashArray:[3,3]};
         if(horiz){ // folha deitada (15×10): etiqueta à esquerda, lista à direita
-          const PW=H, PH=W, sL=Math.min(1,PH/lh), lw=lp.w*sL, aw=PW-lw-gap, c=Math.min(aw/nw,PH/nh);
+          const PW=H, PH=W, sL=Math.min((PH-2*m)/lh,(PW-2*m)*0.6/lw), llw=lw*sL, aw=PW-2*m-llw-gap, c=Math.min(aw/nw,(PH-2*m)/nh);
           const page=out.addPage([PW,PH]);
-          page.drawPage(eL,{x:0,y:PH-lh*sL,width:lw,height:lh*sL});
-          drawInfo(page,lw+gap,PH,c);
-          page.drawLine({start:{x:lw+gap/2,y:PH*0.04},end:{x:lw+gap/2,y:PH*0.96},...line()});
+          page.drawPage(eL,{x:m,y:PH-m-lh*sL,width:llw,height:lh*sL});
+          drawInfo(page,m+llw+gap,PH-m,c);
+          page.drawLine({start:{x:m+llw+gap/2,y:PH*0.04},end:{x:m+llw+gap/2,y:PH*0.96},...dash});
         } else { // folha em pé (10×15): etiqueta em cima, lista embaixo
-          let s,ih,gapS;
-          if(ip.rot){ const c=W/ip.h; ih=nh*c; gapS=gap; s=Math.min(1,(H-gap-ih)/lh); }
-          else { s=H/(lh+nh+gap); ih=nh*s; gapS=gap*s; }
-          const c=ip.rot?W/ip.h:s, page=out.addPage([W,H]);
-          page.drawPage(eL,{x:(W-lp.w*s)/2,y:H-lh*s,width:lp.w*s,height:lh*s});
-          drawInfo(page,(W-nw*c)/2,ih,c);
-          page.drawLine({start:{x:W*0.05,y:ih+gapS/2},end:{x:W*0.95,y:ih+gapS/2},...line()});
+          const aw=W-2*m;
+          let s,c;
+          if(ip.rot){ c=aw/nw; s=Math.min((H-2*m-gap-nh*c)/lh,aw/lw); }
+          else { s=c=Math.min((H-2*m-gap)/(lh+nh),aw/Math.max(lw,nw)); }
+          const ih=nh*c, page=out.addPage([W,H]);
+          page.drawPage(eL,{x:(W-lw*s)/2,y:H-m-lh*s,width:lw*s,height:lh*s});
+          drawInfo(page,(W-nw*c)/2,m+ih,c);
+          page.drawLine({start:{x:W*0.05,y:m+ih+gap/2},end:{x:W*0.95,y:m+ih+gap/2},...dash});
         }
         continue;
       }
