@@ -193,6 +193,10 @@ td.in{color:var(--ok)} td.out{color:var(--bad)}
       </div>
       <label><input type="checkbox" id="byProduct" checked>Separar por produto</label>
       <label><input type="checkbox" id="mergeSheets" checked>Etiqueta e lista do pedido na mesma folha</label>
+      <div class="seg" role="radiogroup" aria-label="Posição na folha" id="mergeLayoutSeg">
+        <label><input type="radio" name="mergeLayout" value="vert" checked>Em pé (10×15)</label>
+        <label><input type="radio" name="mergeLayout" value="horiz">Deitada (15×10, lado a lado)</label>
+      </div>
       <label><input type="checkbox" id="dividers">Folha divisória entre grupos</label>
       <label><input type="checkbox" id="summaryPage" checked>Resumo de peças no começo do PDF</label>
     </div>
@@ -964,25 +968,36 @@ async function buildPdf(){
       const f=files[o.fi], pg=o.pages.map(k=>f.pages[k]);
       const labelIdx=o.pages.find((k,j)=>!pg[j].isInfo), infoIdx=o.pages.find((k,j)=>pg[j].isInfo);
       if($("mergeSheets").checked && o.pages.length===2 && labelIdx!=null && infoIdx!=null && (f.pages[infoIdx].rot||!f.pages[infoIdx].noText)){
-        const lp=f.pages[labelIdx], ip=f.pages[infoIdx], W=lp.w, H=lp.h, gap=H*0.012;
+        const lp=f.pages[labelIdx], ip=f.pages[infoIdx], W=lp.w, H=lp.h, horiz=document.querySelector('input[name="mergeLayout"]:checked').value==="horiz";
         const lBottom=lp.inkBottom!=null?Math.max(0,lp.h-lp.inkBottom):0, lh=lp.h-lBottom; // etiqueta sem o branco do rodapé
-        let s, ih, gapS, iBox;
-        if(ip.rot){ // checklist girado: recorta até onde tem tinta e gira de volta
-          const c=W/ip.h; iBox={left:0,bottom:0,right:ip.inkRight,top:ip.h};
-          ih=ip.inkRight*c; gapS=gap; s=Math.min(1,(H-gap-ih)/lh);
-        } else { // lista com texto (TikTok): só a parte que tem texto
-          const bottom=Math.min(ip.h*0.6,ip.contentBottom); iBox={left:0,bottom,right:ip.w,top:ip.h};
-          s=H/(lh+(ip.h-bottom)+gap); ih=(ip.h-bottom)*s; gapS=gap*s;
-        }
+        // lista do pedido: recorta o que tem conteúdo. nw×nh = tamanho natural já na posição de leitura
+        let iBox, nw, nh;
+        if(ip.rot){ iBox={left:0,bottom:0,right:ip.inkRight,top:ip.h}; nw=ip.h; nh=ip.inkRight; } // checklist da Shopee vem girado
+        else { const bottom=Math.min(ip.h*0.6,ip.contentBottom); iBox={left:0,bottom,right:ip.w,top:ip.h}; nw=ip.w; nh=ip.h-bottom; }
         const [eL,eI]=await Promise.all([
           out.embedPage(srcs[o.fi].getPage(labelIdx),{left:0,bottom:lBottom,right:lp.w,top:lp.h}),
           out.embedPage(srcs[o.fi].getPage(infoIdx),iBox)
         ]);
-        const page=out.addPage([W,H]);
-        page.drawPage(eL,{x:(W-lp.w*s)/2,y:H-lh*s,width:lp.w*s,height:lh*s});
-        if(ip.rot){ const c=W/ip.h; page.drawPage(eI,{x:0,y:ih,width:ip.inkRight*c,height:ip.h*c,rotate:PDFLib.degrees(-90)}); }
-        else page.drawPage(eI,{x:(W-ip.w*s)/2,y:0,width:ip.w*s,height:ih});
-        page.drawLine({start:{x:W*0.05,y:ih+gapS/2},end:{x:W*0.95,y:ih+gapS/2},thickness:0.5,color:rgb(0.5,0.5,0.5),dashArray:[3,3]});
+        const drawInfo=(page,x,yTop,c)=>{ // (x,yTop) = canto superior esquerdo da lista já na posição de leitura
+          if(ip.rot) page.drawPage(eI,{x,y:yTop,width:ip.inkRight*c,height:ip.h*c,rotate:PDFLib.degrees(-90)});
+          else page.drawPage(eI,{x,y:yTop-nh*c,width:nw*c,height:nh*c});
+        };
+        const gap=H*0.012, line=color=>({thickness:0.5,color:rgb(0.5,0.5,0.5),dashArray:[3,3]});
+        if(horiz){ // folha deitada (15×10): etiqueta à esquerda, lista à direita
+          const PW=H, PH=W, sL=Math.min(1,PH/lh), lw=lp.w*sL, aw=PW-lw-gap, c=Math.min(aw/nw,PH/nh);
+          const page=out.addPage([PW,PH]);
+          page.drawPage(eL,{x:0,y:PH-lh*sL,width:lw,height:lh*sL});
+          drawInfo(page,lw+gap,PH,c);
+          page.drawLine({start:{x:lw+gap/2,y:PH*0.04},end:{x:lw+gap/2,y:PH*0.96},...line()});
+        } else { // folha em pé (10×15): etiqueta em cima, lista embaixo
+          let s,ih,gapS;
+          if(ip.rot){ const c=W/ip.h; ih=nh*c; gapS=gap; s=Math.min(1,(H-gap-ih)/lh); }
+          else { s=H/(lh+nh+gap); ih=nh*s; gapS=gap*s; }
+          const c=ip.rot?W/ip.h:s, page=out.addPage([W,H]);
+          page.drawPage(eL,{x:(W-lp.w*s)/2,y:H-lh*s,width:lp.w*s,height:lh*s});
+          drawInfo(page,(W-nw*c)/2,ih,c);
+          page.drawLine({start:{x:W*0.05,y:ih+gapS/2},end:{x:W*0.95,y:ih+gapS/2},...line()});
+        }
         continue;
       }
       const copied=await out.copyPages(srcs[o.fi],o.pages);
@@ -1072,6 +1087,7 @@ async function demoPdf(){
 
 /* ---------- Eventos ---------- */
 const drop=$("drop"), input=$("fileInput");
+{ const ms=$("mergeSheets"), sync=()=>document.querySelectorAll('input[name="mergeLayout"]').forEach(r=>r.disabled=!ms.checked); ms.addEventListener("change",sync); sync(); }
 drop.addEventListener("click",()=>input.click());
 drop.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();input.click();}});
 input.addEventListener("change",()=>{addFiles([...input.files]); input.value="";});
