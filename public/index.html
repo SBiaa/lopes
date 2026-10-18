@@ -548,8 +548,12 @@ async function readPage(pdf,n){
     await page.render({canvasContext:ctx,viewport:vp}).promise;
     ink=inkRect(cv,vp.width,vp.height,235);
   }catch(e){ ink=null; }
-
   const hdr=cells.find(c=>/^(product name|nome do produto|produto)$/i.test(c.s));
+  // lista do TikTok: só a tabela (do cabeçalho "Product Name" até "Qty Total"); título, códigos e rodapé se repetem na etiqueta
+  let tableInk=null;
+  const qtyT=cells.find(c=>/^qty\s*total/i.test(c.s));
+  if(ink&&hdr&&qtyT){ const t=Math.max(ink.t,vp.height-(hdr.y+11)), b2=Math.min(ink.b,vp.height-qtyT.y+5); if(b2>t+20) tableInk={l:ink.l,r:ink.r,t,b:b2}; }
+
   const skuH=cells.find(c=>/^(sku|varia[cç][aã]o)$/i.test(c.s));
   const sellerH=cells.find(c=>/^seller sku$/i.test(c.s));
   const qtyFor=(c)=>{const q=cells.find(o=>o!==c && Math.abs(o.y-c.y)<2.2 && o.x>c.x2 && /^\d{1,3}$/.test(o.s)); return q?parseInt(q.s,10):1;};
@@ -592,7 +596,7 @@ async function readPage(pdf,n){
   const qtyTotal=(text.match(/qty\s*total\s*:?\s*(\d+)/i)||[])[1];
   const tracking=(text.match(/tracking\s*number\s*:?\s*([A-Z0-9]{8,30})/i)||[])[1]||null;
   const tokens=new Set((text.match(/\b[A-Z]{0,4}\d{10,24}[A-Z]{0,4}\b/g)||[]));
-  return {n,w:vp.width,h:vp.height,ink,text,vars,product,qtyTotal:qtyTotal?parseInt(qtyTotal,10):null,tracking,tokens,noText:!items.length,key:(tracking?"t:"+tracking:(text?"h:"+cyrb53(text):"")),
+  return {n,w:vp.width,h:vp.height,ink,tableInk,text,vars,product,qtyTotal:qtyTotal?parseInt(qtyTotal,10):null,tracking,tokens,noText:!items.length,key:(tracking?"t:"+tracking:(text?"h:"+cyrb53(text):"")),
           isInfo:vars.length>0||/packing list|lista de separa|product name|nome do produto/i.test(text)};
 }
 
@@ -650,13 +654,13 @@ function inkRatio(cv,r){
   for(let i=0;i<d.length;i+=4) if(d[i]<128) k++;
   return k/(r.w*r.h);
 }
-// limites da tinta (pixels < limiar) em pontos {l,r,t,b} a partir do topo-esquerda, com folga de 6 pt
+// limites da tinta (pixels < limiar) em pontos {l,r,t,b} a partir do topo-esquerda, com folga de 2 pt
 function inkRect(cv,wPt,hPt,thr){
   const w=cv.width,h=cv.height,d=cv.getContext("2d").getImageData(0,0,w,h).data;
   let x0=w,x1=-1,y0=h,y1=-1;
   for(let y=0;y<h;y++) for(let x=0;x<w;x++){ const o=(y*w+x)*4; if(d[o]<thr||d[o+1]<thr||d[o+2]<thr){ if(x<x0)x0=x; if(x>x1)x1=x; if(y<y0)y0=y; if(y>y1)y1=y; } }
   if(x1<0) return null;
-  const kx=wPt/w, ky=hPt/h, pad=6;
+  const kx=wPt/w, ky=hPt/h, pad=2;
   return {l:Math.max(0,x0*kx-pad), r:Math.min(wPt,(x1+1)*kx+pad), t:Math.max(0,y0*ky-pad), b:Math.min(hPt,(y1+1)*ky+pad)};
 }
 function rotateCw(src){
@@ -980,7 +984,7 @@ async function buildPdf(){
       if($("mergeSheets").checked && o.pages.length===2 && labelIdx!=null && infoIdx!=null && f.pages[infoIdx].ink){
         const lp=f.pages[labelIdx], ip=f.pages[infoIdx], W=lp.w, H=lp.h, horiz=document.querySelector('input[name="mergeLayout"]:checked').value==="horiz";
         // recorta o branco: cada parte vira só a região com tinta (l,r,t,b em pontos a partir do topo-esquerda)
-        const lk=lp.ink||{l:0,r:lp.w,t:0,b:lp.h}, ik=ip.ink||{l:0,r:ip.w,t:0,b:ip.h};
+        const lk=lp.ink||{l:0,r:lp.w,t:0,b:lp.h}, ik=ip.tableInk||ip.ink||{l:0,r:ip.w,t:0,b:ip.h};
         const lw=lk.r-lk.l, lh=lk.b-lk.t;
         const nw=ip.rot?ik.b-ik.t:ik.r-ik.l, nh=ip.rot?ik.r-ik.l:ik.b-ik.t; // tamanho da lista já na posição de leitura (a da Shopee vem girada)
         const [eL,eI]=await Promise.all([
@@ -991,7 +995,7 @@ async function buildPdf(){
           if(ip.rot) page.drawPage(eI,{x,y:yTop,width:(ik.r-ik.l)*c,height:(ik.b-ik.t)*c,rotate:PDFLib.degrees(-90)});
           else page.drawPage(eI,{x,y:yTop-nh*c,width:nw*c,height:nh*c});
         };
-        const m=4, gap=H*0.012, dash={thickness:0.5,color:rgb(0.5,0.5,0.5),dashArray:[3,3]};
+        const m=3, gap=H*0.008, dash={thickness:0.5,color:rgb(0.5,0.5,0.5),dashArray:[3,3]};
         if(horiz){ // folha deitada (15×10): etiqueta à esquerda, lista à direita
           const PW=H, PH=W, sL=Math.min((PH-2*m)/lh,(PW-2*m)*0.6/lw), llw=lw*sL, aw=PW-2*m-llw-gap, c=Math.min(aw/nw,(PH-2*m)/nh);
           const page=out.addPage([PW,PH]);
